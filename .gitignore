@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build artifacts
+*.zip
+dist/
+
+# Native build temp files
+native/.build_venv*
+native/.build_win_*
+native/.wheel_build_*
+native/.toolchain-win.cmake
+native/.pbs_release.json
+native/.py_standalone_win/

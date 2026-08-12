@@ -1,0 +1,3 @@
+# Test dependencies for io_beamng_dae
+pytest>=7.0
+numpy>=1.20

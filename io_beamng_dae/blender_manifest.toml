@@ -1,0 +1,21 @@
+schema_version = "1.0.0"
+id = "io_beamng_dae"
+version = "1.0.0"
+name = "BeamNG Collada Importer/Exporter"
+tagline = "Import and export .dae and .cdae mesh files"
+maintainer = "Blenux"
+type = "add-on"
+blender_version_min = "5.0.1"
+license = ["SPDX:GPL-2.0-or-later"]
+tags = ["Import-Export", "Mesh"]
+website = "https://github.com/Blenux/io_beamng_dae_dev"
+
+# Platform-specific native module — built from native/ subdirectory.
+platforms = ["linux-x64", "windows-x64"]
+
+wheels = [
+  "./wheels/cdae_native-2.0.0-cp311-cp311-linux_x86_64.whl",
+  "./wheels/cdae_native-2.0.0-cp311-cp311-win_amd64.whl",
+  "./wheels/cdae_native-2.0.0-cp313-cp313-linux_x86_64.whl",
+  "./wheels/cdae_native-2.0.0-cp313-cp313-win_amd64.whl",
+]
