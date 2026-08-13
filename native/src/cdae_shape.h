@@ -36,6 +36,9 @@ struct Material {
     float base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f}; /* RGBA */
     float roughness = 0.5f;
     float metallic = 0.0f;
+    float ior = 1.45f; /* Index of refraction. */
+    bool has_shininess = false; /* Whether original DAE had <shininess>. */
+    bool has_reflectivity = false; /* Whether original DAE had <reflectivity>. */
 };
 
 /* Mesh data (supports both DAE XML and CDAE binary). */
@@ -47,15 +50,22 @@ struct Mesh {
     int32_t verts_per_frame = 0;
     int32_t parent_mesh = -1;
     uint32_t mesh_flags = 0;
+    std::string geometry_name;
 
     VectorBlock verts;
     VectorBlock norms;
     VectorBlock tverts;       /* UV layer 0 */
     VectorBlock tverts2;      /* UV layer 1 */
+    std::vector<VectorBlock> tverts_extra; /* UV layers 2+ */
+    std::vector<std::string> tvert_names;  /* UV layer names for bind_vertex_input */
     VectorBlock colors;
+    std::vector<VectorBlock> color_layers;
+    std::vector<std::string> color_layer_names;
     VectorBlock tangents;
     VectorBlock indices;
     VectorBlock primitives;
+    VectorBlock line_indices; /* Loose edge indices (pairs of position-source vertex indices) for <lines> elements */
+    VectorBlock line_verts;   /* Original position array referenced by line indices */
     VectorBlock encoded_norms; /* CDAE binary: packed uint8 normals */
 
     /* SkinMesh extras — parsed for round-trip but unused for import. */

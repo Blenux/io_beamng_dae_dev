@@ -15,7 +15,7 @@
 #   - curl, tar, git
 #
 # Usage:
-#   ./build_windows.sh                # Build for all (3.11, 3.13)
+#   ./build_windows.sh                # Build for all supported Blender Python versions
 #   ./build_windows.sh 3.11           # Build for specific version only
 #   ./build_windows.sh 3.11 3.13      # Build for specific versions
 #
@@ -26,7 +26,19 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PY_VERSIONS="${@:-3.11 3.13}"
+# Supported Blender extension Python ABI versions
+SUPPORTED_PY_VERSIONS="3.11 3.13"
+
+# Determine target Python version(s)
+if [ $# -gt 0 ]; then
+    PY_VERSIONS="$@"
+else
+    PY_VERSIONS="$SUPPORTED_PY_VERSIONS"
+fi
+
+echo "Building cdae_native Windows wheels for Python: $PY_VERSIONS"
+echo ""
+
 WHEELS_DIR="$SCRIPT_DIR/../io_beamng_dae/wheels"
 PY_STANDALONE_DIR="$SCRIPT_DIR/.py_standalone_win"
 

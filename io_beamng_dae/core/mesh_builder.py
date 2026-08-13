@@ -30,14 +30,25 @@ class MeshBuilder:
         objects_data = data.get("objects", [])
         names = data.get("names", [])
 
-        # BLX - Use a named collection when enabled, otherwise the scene's active collection
+        # Use a named collection when enabled, otherwise the scene's active collection
         col = self._get_import_collection() if self.use_collection else self.context.collection
 
         for mesh_idx, mesh_dict in enumerate(meshes_data):
+            obj_name = self._get_mesh_name(mesh_idx, objects_data, names)
+            geo_name = mesh_dict.get("geometry_name", "")
+            tvert_names = mesh_dict.get("tvert_names", [])
+
             if mesh_dict.get("is_null", False):
+                mesh = bpy.data.meshes.new(obj_name)
+                obj = bpy.data.objects.new(obj_name, mesh)
+                col.objects.link(obj)
+                if geo_name:
+                    obj["dae_geometry_name"] = geo_name
+                if tvert_names:
+                    obj["dae_tvert_names"] = list(tvert_names)
+                objects[mesh_idx] = obj
                 continue
 
-            obj_name = self._get_mesh_name(mesh_idx, objects_data, names)
             mesh = self._create_mesh(obj_name, mesh_dict)
 
             if mesh is None:
@@ -45,6 +56,10 @@ class MeshBuilder:
 
             obj = bpy.data.objects.new(obj_name, mesh)
             col.objects.link(obj)
+            if geo_name:
+                obj["dae_geometry_name"] = geo_name
+            if tvert_names:
+                obj["dae_tvert_names"] = list(tvert_names)
             self._assign_materials(mesh, mesh_dict)
             objects[mesh_idx] = obj
 
@@ -101,6 +116,13 @@ class MeshBuilder:
 
         verts_np = np.asarray(vertices, dtype=np.float32)
         vert_count = verts_np.shape[0]
+
+        # Lines-only mesh (no triangles): build from line data directly
+        line_indices = mesh_dict.get("line_indices")
+        line_verts = mesh_dict.get("line_verts")
+        if vert_count == 0 and line_indices is not None and line_verts is not None:
+            return self._create_lines_only_mesh(name, mesh_dict, line_indices, line_verts)
+
         if vert_count == 0:
             return None
 
@@ -109,13 +131,15 @@ class MeshBuilder:
         normals = mesh_dict.get("normals")
         uv0 = mesh_dict.get("uv0")
         uv1 = mesh_dict.get("uv1")
+        uv_extra = mesh_dict.get("uv_extra", [])
+        tvert_names = mesh_dict.get("tvert_names", [])
         colors = mesh_dict.get("colors")
 
         # Build triangle list from primitives or indices
         if primitives is not None and indices is not None:
             prims_np = np.asarray(primitives, dtype=np.uint32)
             idx_np = np.asarray(indices, dtype=np.uint32)
-            # BLX - Vectorized: build (v0, v1, v2, mat) per triangle, reversed winding (2,1,0)
+            # Vectorized: build (v0, v1, v2, mat) per triangle, reversed winding (2,1,0)
             # Extract primitive fields as arrays
             istarts = prims_np[:, 0].astype(np.int64)
             icounts = prims_np[:, 1].astype(np.int64)
@@ -150,7 +174,7 @@ class MeshBuilder:
 
         elif indices is not None:
             idx_np = np.asarray(indices, dtype=np.uint32)
-            # BLX - Vectorized: reshape indices to triangles, reverse winding
+            # Vectorized: reshape indices to triangles, reverse winding
             n_tris = len(idx_np) // 3
             if n_tris == 0:
                 return None
@@ -167,7 +191,7 @@ class MeshBuilder:
             tris_np = tris_np[valid]
             tri_mats_np = tri_mats_np[valid]
         else:
-            # BLX - Sequential indices: triangles can't be degenerate by index
+            # Sequential indices: triangles can't be degenerate by index
             tris = [(i+2, i+1, i) for i in range(0, vert_count - 2, 3)]
             tri_mats = [0] * len(tris)
 
@@ -226,6 +250,12 @@ class MeshBuilder:
         mesh.from_pydata(verts_list, [], faces_list)
         mesh.update()
 
+        # Add loose edges from <lines> elements (if present)
+        line_indices = mesh_dict.get("line_indices")
+        line_verts = mesh_dict.get("line_verts")
+        if line_indices is not None and line_verts is not None:
+            self._add_loose_edges(mesh, line_indices, line_verts, dedup_positions)
+
         # Material indices set later in _assign_materials
         mesh_dict["_tri_mats"] = tri_mats_np
 
@@ -256,8 +286,24 @@ class MeshBuilder:
                 uv1_data[valid, 1] = 1.0 - uv1_np[corner_orig_vi[valid], 1]
             uv1_layer.data.foreach_set("uv", uv1_data.reshape(-1))
 
+        # Extra UV layers (2+)
+        for ei, uv_data in enumerate(uv_extra):
+            uv_set = ei + 2
+            layer_name = tvert_names[uv_set] if uv_set < len(tvert_names) else f"UV{uv_set}"
+            uv_np = np.asarray(uv_data, dtype=np.float32)
+            uv_layer = mesh.uv_layers.new(name=layer_name)
+            uv_arr = np.zeros((loop_count, 2), dtype=np.float32)
+            valid = corner_orig_vi < uv_np.shape[0]
+            uv_arr[valid, 0] = uv_np[corner_orig_vi[valid], 0]
+            uv_arr[valid, 1] = uv_np[corner_orig_vi[valid], 1]
+            uv_layer.data.foreach_set("uv", uv_arr.reshape(-1))
+
         # Vertex colors (RGBA uint8)
-        if colors is not None:
+        # When color_layers is present, skip the single "Color" attribute
+        # to avoid duplicating the first layer.
+        color_layers = mesh_dict.get("color_layers")
+        color_layer_names = mesh_dict.get("color_layer_names")
+        if colors is not None and color_layers is None:
             colors_np = np.asarray(colors, dtype=np.uint8)
             color_layer = mesh.color_attributes.new(name="Color", type="BYTE_COLOR", domain="CORNER")
             col_data = np.zeros((loop_count, 4), dtype=np.float32)
@@ -265,6 +311,18 @@ class MeshBuilder:
             col_data[valid] = colors_np[corner_orig_vi[valid]].astype(np.float32) / 255.0
             color_layer.data.foreach_set("color", col_data.reshape(-1))
             mesh.color_attributes.active_color = color_layer
+
+        # Create all color layers from color_layers with original names.
+        if color_layers is not None and color_layer_names is not None:
+            for li, (cl_data_arr, cl_name) in enumerate(zip(color_layers, color_layer_names)):
+                cl_np = np.asarray(cl_data_arr, dtype=np.uint8)
+                cl_attr = mesh.color_attributes.new(name=cl_name, type="BYTE_COLOR", domain="CORNER")
+                cl_data = np.zeros((loop_count, 4), dtype=np.float32)
+                valid = corner_orig_vi < cl_np.shape[0]
+                cl_data[valid] = cl_np[corner_orig_vi[valid]].astype(np.float32) / 255.0
+                cl_attr.data.foreach_set("color", cl_data.reshape(-1))
+                if li == 0:
+                    mesh.color_attributes.active_color = cl_attr
 
         # Normals + sharp edge derivation from normal divergence
         if has_normals:
@@ -304,6 +362,116 @@ class MeshBuilder:
 
         mesh.update()
         return mesh
+
+    def _create_lines_only_mesh(self, name, mesh_dict, line_indices, line_verts):
+        """Create a Blender mesh with only vertices and loose edges from <lines> data."""
+        line_idx_np = np.asarray(line_indices, dtype=np.int32)
+        line_vts_np = np.asarray(line_verts, dtype=np.float32)
+
+        if line_idx_np.shape[0] == 0 or line_vts_np.shape[0] == 0:
+            return None
+
+        # All line vertices become mesh vertices
+        verts_list = (line_vts_np * self.global_scale).tolist()
+        # Build edges from line index pairs
+        edges_list = [[int(p[0]), int(p[1])] for p in line_idx_np
+                      if int(p[0]) != int(p[1])]
+
+        mesh = bpy.data.meshes.new(name)
+        mesh.from_pydata(verts_list, edges_list, [])
+        mesh.update()
+
+        # Store material info for _assign_materials
+        mesh_dict["_tri_mats"] = np.zeros(0, dtype=np.int32)
+
+        return mesh
+
+    def _add_loose_edges(self, mesh, line_indices, line_verts, dedup_positions):
+        """Add loose edges from <lines> element data.
+
+        Uses position-based matching to map line vertices to existing Blender vertices.
+        Line indices reference the original position source, which is a different index
+        space from the per-corner triangle data.
+
+        line_indices: (N, 2) array of position-source vertex index pairs
+        line_verts: (M, 3) array of original position source vertices
+        dedup_positions: (K, 3) array of deduplicated Blender vertex positions (already scaled)
+        """
+        line_idx_np = np.asarray(line_indices, dtype=np.int32)
+        line_vts_np = np.asarray(line_verts, dtype=np.float32)
+
+        if line_idx_np.shape[0] == 0 or line_vts_np.shape[0] == 0:
+            return
+
+        # Build quantized position → Blender vertex index map from existing vertices
+        # Use the same quantization as the dedup (round to 5 decimal places)
+        dedup_quant = np.round(dedup_positions * 100000).astype(np.int64)
+        pos_to_blender = {}
+        for bi in range(len(dedup_quant)):
+            key = tuple(dedup_quant[bi].tolist())
+            if key not in pos_to_blender:
+                pos_to_blender[key] = bi
+
+        existing_count = len(mesh.vertices)
+        new_vert_count = 0
+        new_edges = []
+
+        for pair in line_idx_np:
+            edge_verts = []
+            for idx in pair:
+                idx = int(idx)
+                if idx >= line_vts_np.shape[0]:
+                    edge_verts.append(0)
+                    continue
+
+                pos = line_vts_np[idx] * self.global_scale
+                quant = tuple(np.round(pos * 100000).astype(np.int64).tolist())
+
+                if quant in pos_to_blender:
+                    edge_verts.append(pos_to_blender[quant])
+                else:
+                    # Line-only vertex — add it
+                    pos_to_blender[quant] = existing_count + new_vert_count
+                    new_vert_count += 1
+                    edge_verts.append(pos_to_blender[quant])
+            if len(edge_verts) == 2 and edge_verts[0] != edge_verts[1]:
+                new_edges.append(edge_verts)
+
+        if new_vert_count > 0 or new_edges:
+            import bmesh
+            bm = bmesh.new()
+            bm.from_mesh(mesh)
+
+            # Add new line-only vertices
+            if new_vert_count > 0:
+                # Build reverse map: blender index → position
+                new_pos_map = {}
+                for quant, bi in pos_to_blender.items():
+                    if bi >= existing_count:
+                        new_pos_map[bi] = quant
+
+                for bi in range(existing_count, existing_count + new_vert_count):
+                    quant = new_pos_map.get(bi)
+                    if quant is not None:
+                        pos = np.array(quant, dtype=np.float32) / 100000.0
+                        bm.verts.new(tuple(pos))
+                    else:
+                        bm.verts.new((0, 0, 0))
+
+            bm.verts.ensure_lookup_table()
+
+            # Add loose edges
+            for edge_verts in new_edges:
+                v0 = edge_verts[0]
+                v1 = edge_verts[1]
+                if v0 < len(bm.verts) and v1 < len(bm.verts):
+                    try:
+                        bm.edges.new([bm.verts[v0], bm.verts[v1]])
+                    except ValueError:
+                        pass  # edge already exists
+
+            bm.to_mesh(mesh)
+            bm.free()
 
     def _assign_materials(self, mesh, mesh_dict):
         """Assign only used materials to mesh and remap face indices to local slots."""

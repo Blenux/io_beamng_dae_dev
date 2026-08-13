@@ -10,12 +10,12 @@
 #   - cmake (uv will install it in the venv if not on PATH)
 #
 # Usage:
-#   ./build_macos.sh                         # Build for current arch (arm64 or x86_64)
-#   ./build_macos.sh --blender-python        # Build using Blender's Python ABI version
+#   ./build_macos.sh                         # Build for all supported Blender Python versions, current arch
 #   ./build_macos.sh --arch arm64            # Build for Apple Silicon only
 #   ./build_macos.sh --arch x86_64           # Build for Intel only
 #   ./build_macos.sh --arch universal2       # Build universal2 (arm64 + x86_64)
-#   BLENDER_PY_VER=3.13 ./build_macos.sh --blender-python --arch arm64
+#   ./build_macos.sh 3.13 --arch arm64       # Build for specific Python version only
+#   ./build_macos.sh 3.11 3.13 --arch arm64  # Build for specific versions
 #
 # Wheels are output to ../io_beamng_dae/wheels/
 
@@ -26,25 +26,29 @@ cd "$SCRIPT_DIR"
 
 # Defaults
 ARCH=""
-BLENDER_PY=""
 
-# Parse args
+# Supported Blender extension Python ABI versions
+SUPPORTED_PY_VERSIONS="3.11 3.13"
+
+# Parse args — separate --arch flags from Python version args
+PY_VERSIONS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --arch)
             ARCH="$2"
             shift 2
             ;;
-        --blender-python)
-            BLENDER_PY="1"
-            shift
-            ;;
         *)
-            echo "Unknown option: $1"
-            exit 1
+            PY_VERSIONS="$PY_VERSIONS $1"
+            shift
             ;;
     esac
 done
+
+# Default Python versions if none specified
+if [ -z "$PY_VERSIONS" ]; then
+    PY_VERSIONS="$SUPPORTED_PY_VERSIONS"
+fi
 
 # Default arch: current host architecture
 if [ -z "$ARCH" ]; then
@@ -69,54 +73,36 @@ case "$ARCH" in
     *) echo "Error: Unknown arch '$ARCH' (use arm64, x86_64, or universal2)"; exit 1 ;;
 esac
 
-# Determine target Python version
-if [ -n "$BLENDER_PY" ]; then
-    if [ -z "$BLENDER_PY_VER" ]; then
-        echo "Detecting Blender's Python ABI version..."
-        BLENDER_PY_VER=$(blender --background --python-expr "
-import importlib.machinery, re, sys
-suffix = importlib.machinery.EXT_SUFFIX
-m = re.search(r'cpython-(\d+)(\d+)', suffix)
-if m:
-    print('PYVER:' + m.group(1) + '.' + m.group(2))
-else:
-    print('PYVER:' + '.'.join(str(v) for v in sys.version_info[:2]))
-" 2>/dev/null | grep -oP '(?<=PYVER:).*' | head -1)
+# Always use Blender's Python ABI version (unless manually overridden)
+echo "Building for macOS ($ARCH), Python: $PY_VERSIONS"
+echo "Deployment target: $MACOSX_DEPLOYMENT_TARGET"
+echo ""
 
-        if [ -z "$BLENDER_PY_VER" ]; then
-            echo "Error: Could not detect Blender's Python version. Is blender on PATH?"
-            echo "Set manually: BLENDER_PY_VER=3.13 ./build_macos.sh --blender-python"
-            exit 1
-        fi
-    fi
-    echo "Blender extension ABI: Python $BLENDER_PY_VER"
-    TARGET_PY="$BLENDER_PY_VER"
-else
-    echo "Building with system Python..."
-    TARGET_PY=""
-fi
+# Build for each Python version
+for PYVER in $PY_VERSIONS; do
+    echo "============================================"
+    echo "Building for Python $PYVER (macOS $ARCH)"
+    echo "============================================"
 
-# Create venv
-VENV_DIR="$SCRIPT_DIR/.build_venv_macos"
-echo "Creating uv venv at $VENV_DIR (Python $TARGET_PY)..."
-if [ -n "$TARGET_PY" ]; then
-    uv venv "$VENV_DIR" --python "$TARGET_PY"
-else
-    uv venv "$VENV_DIR"
-fi
-source "$VENV_DIR/bin/activate"
+    # Create venv
+    VENV_DIR="$SCRIPT_DIR/.build_venv_macos_$PYVER"
+    echo "Creating uv venv at $VENV_DIR (Python $PYVER)..."
+    uv venv "$VENV_DIR" --python "$PYVER"
+    source "$VENV_DIR/bin/activate"
 
-echo "Installing build dependencies via uv..."
-uv pip install build pybind11 cmake scikit-build-core
+    echo "Installing build dependencies via uv..."
+    uv pip install build pybind11 cmake scikit-build-core
 
-# Build with macOS-specific CMake flags
-echo "Building wheel..."
-export CMAKE_OSX_ARCHITECTURES="$CMAKE_ARCH"
-python -m build --wheel --outdir "$SCRIPT_DIR/../io_beamng_dae/wheels"
+    # Build with macOS-specific CMake flags
+    echo "Building wheel..."
+    export CMAKE_OSX_ARCHITECTURES="$CMAKE_ARCH"
+    python -m build --wheel --outdir "$SCRIPT_DIR/../io_beamng_dae/wheels"
 
-# Deactivate and clean up
-deactivate
-rm -rf "$VENV_DIR"
+    # Deactivate and clean up
+    deactivate
+    rm -rf "$VENV_DIR"
+    echo ""
+done
 
 echo ""
 echo "Build complete. Wheel(s) in ../io_beamng_dae/wheels/:"

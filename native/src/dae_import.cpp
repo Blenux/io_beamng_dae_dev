@@ -118,7 +118,7 @@ static std::string attr_source_id(const pugi::xml_node &node, const char *attr_n
     return std::string(val);
 }
 
-/* BLX - Safe string-to-int conversion using strtol with error checking.
+/* Safe string-to-int conversion using strtol with error checking.
  * Returns 0 on parse failure, clamps to INT_MIN/INT_MAX on overflow. */
 static int safe_atoi(const char *str)
 {
@@ -130,7 +130,7 @@ static int safe_atoi(const char *str)
     return int(val);
 }
 
-/* BLX - Safe string-to-float conversion using strtof with error checking.
+/* Safe string-to-float conversion using strtof with error checking.
  * Returns 0.0f on parse failure. */
 static float safe_atof(const char *str)
 {
@@ -168,11 +168,18 @@ struct DaeTriangles {
     std::vector<DaeInput> inputs;
 };
 
+struct DaeLines {
+    int line_count = 0;
+    std::vector<int> indices;
+    std::vector<DaeInput> inputs;
+};
+
 struct DaeGeometry {
     std::string id;
     std::string name;
     std::map<std::string, DaeSource> sources;
     std::vector<DaeTriangles> triangles;
+    std::vector<DaeLines> lines;
 };
 
 struct DaeNode {
@@ -181,6 +188,7 @@ struct DaeNode {
     float matrix[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
     std::string geometry_url;
     std::map<std::string, std::string> material_bindings;
+    std::map<int, std::string> uv_layer_names; /* input_set → UV layer name from bind_vertex_input */
     std::vector<DaeNode> children;
 };
 
@@ -337,6 +345,26 @@ static DaeTriangles parse_polylist(const pugi::xml_node &poly_node)
     return result;
 }
 
+static DaeLines parse_lines(const pugi::xml_node &lines_node)
+{
+    DaeLines result;
+    pugi::xml_attribute count = lines_node.attribute("count");
+    if (count) {
+        result.line_count = safe_atoi(count.value());
+    }
+
+    pugi::xml_node p_elem = child_by_tag(lines_node, "p");
+    if (p_elem) {
+        result.indices = parse_int_array_text(p_elem.text().get());
+    }
+
+    for (pugi::xml_node input : children_by_tag(lines_node, "input")) {
+        result.inputs.push_back(parse_input(input));
+    }
+
+    return result;
+}
+
 static DaeGeometry parse_geometry(const pugi::xml_node &geo_node)
 {
     DaeGeometry geo;
@@ -381,6 +409,9 @@ static DaeGeometry parse_geometry(const pugi::xml_node &geo_node)
     for (pugi::xml_node poly : children_by_tag(mesh, "polylist")) {
         geo.triangles.push_back(parse_polylist(poly));
     }
+    for (pugi::xml_node lines : children_by_tag(mesh, "lines")) {
+        geo.lines.push_back(parse_lines(lines));
+    }
 
     return geo;
 }
@@ -422,6 +453,19 @@ static DaeNode parse_node(const pugi::xml_node &node_elem)
                             target_val++;
                         }
                         node.material_bindings[symbol.value()] = target_val;
+
+                        /* Parse bind_vertex_input for UV layer names. */
+                        for (pugi::xml_node bvi : children_by_tag(inst_mat, "bind_vertex_input")) {
+                            pugi::xml_attribute bvi_sem = bvi.attribute("semantic");
+                            pugi::xml_attribute bvi_isem = bvi.attribute("input_semantic");
+                            pugi::xml_attribute bvi_set = bvi.attribute("input_set");
+                            if (bvi_sem && bvi_isem && bvi_set) {
+                                if (std::string(bvi_isem.value()) == "TEXCOORD") {
+                                    int iset = safe_atoi(bvi_set.value());
+                                    node.uv_layer_names[iset] = bvi_sem.value();
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -489,7 +533,7 @@ static std::vector<float> get_indexed_array(const DaeTriangles &tri,
     result.resize(total_corners * components);
 
     for (int corner = 0; corner < total_corners; corner++) {
-        /* BLX - Bounds-check the index access against tri.indices size. */
+        /* Bounds-check the index access against tri.indices size. */
         int idx_pos = corner * stride + input->offset;
         if (idx_pos < 0 || idx_pos >= indices_size) {
             for (int c = 0; c < components; c++) {
@@ -540,27 +584,75 @@ static Mesh convert_geometry(const DaeGeometry &geo,
         total_triangles += tri.triangle_count;
     }
 
-    if (total_triangles == 0) {
+    if (total_triangles == 0 && geo.lines.empty()) {
         mesh.mesh_type = MESH_NULL;
         return mesh;
     }
 
-    int total_corners = total_triangles * 3;
+    /* If no triangles but lines exist, use 1 dummy corner to avoid empty arrays. */
+    int total_corners = total_triangles > 0 ? total_triangles * 3 : 0;
 
     std::vector<float> dst_verts(total_corners * 3, 0.0f);
     std::vector<float> dst_norms(total_corners * 3, 0.0f);
     std::vector<float> dst_tverts0(total_corners * 2, 0.0f);
     std::vector<float> dst_tverts1(total_corners * 2, 0.0f);
+    std::vector<std::vector<float>> dst_tverts_extra; /* UV layers 2+ */
+    std::vector<int> extra_uv_sets; /* TEXCOORD set numbers for layers 2+ */
     std::vector<uint8_t> dst_colors(total_corners * 4, 255);
+    std::vector<std::vector<uint8_t>> dst_color_layers;
+    std::vector<std::string> color_layer_names;
+    std::vector<int> color_layer_sets;
     std::vector<int32_t> dst_indices(total_corners);
     std::vector<uint32_t> dst_primitives;
+
+    /* Discover extra TEXCOORD sets (set 2+) from the first triangle group. */
+    for (const auto &tri : geo.triangles) {
+        for (const auto &inp : tri.inputs) {
+            if (inp.semantic == "TEXCOORD" && inp.set >= 2) {
+                bool found = false;
+                for (int s : extra_uv_sets) {
+                    if (s == inp.set) { found = true; break; }
+                }
+                if (!found) {
+                    extra_uv_sets.push_back(inp.set);
+                    dst_tverts_extra.emplace_back(total_corners * 2, 0.0f);
+                }
+            }
+        }
+        if (!extra_uv_sets.empty()) break;
+    }
 
     bool has_norms = false;
     bool has_tverts0 = false;
     bool has_tverts1 = false;
     bool has_colors = false;
+    bool has_color_layers = false;
+    int num_color_layers = 0;
 
     int corner_offset = 0;
+
+    /* Discover all COLOR input sets from the first triangle group. */
+    for (const auto &tri : geo.triangles) {
+        for (const auto &inp : tri.inputs) {
+            if (inp.semantic == "COLOR") {
+                /* Extract layer name from source ID (e.g., "Mesh_841-mesh-colors-Col" → "Col"). */
+                std::string lname = inp.source;
+                size_t pos = lname.find("-colors-");
+                if (pos != std::string::npos) {
+                    lname = lname.substr(pos + 8);
+                } else {
+                    lname = "Col";
+                    if (inp.set > 0) lname += std::to_string(inp.set);
+                }
+                color_layer_names.push_back(lname);
+                color_layer_sets.push_back(inp.set);
+                dst_color_layers.emplace_back(total_corners * 4, 255);
+                num_color_layers++;
+            }
+        }
+        if (num_color_layers > 0) break; /* Only need to scan first triangle group. */
+    }
+    if (num_color_layers > 0) has_color_layers = true;
     for (const auto &tri : geo.triangles) {
         int mat_idx = 0;
         const std::string &mat_name = tri.material_name;
@@ -583,6 +675,13 @@ static Mesh convert_geometry(const DaeGeometry &geo,
         std::vector<float> src_tverts0 = get_indexed_array(tri, geo, "TEXCOORD", 0, 2);
         std::vector<float> src_tverts1 = get_indexed_array(tri, geo, "TEXCOORD", 1, 2);
         std::vector<float> src_colors = get_indexed_array(tri, geo, "COLOR", 0, 4);
+        std::vector<std::vector<float>> src_color_layers;
+        if (has_color_layers) {
+            src_color_layers.resize(num_color_layers);
+            for (int li = 0; li < num_color_layers; li++) {
+                src_color_layers[li] = get_indexed_array(tri, geo, "COLOR", color_layer_sets[li], 4);
+            }
+        }
 
         int next_offset = corner_offset + vtx_count;
 
@@ -619,6 +718,17 @@ static Mesh convert_geometry(const DaeGeometry &geo,
             }
         }
 
+        /* Parse extra UV layers (set 2+). */
+        for (size_t ei = 0; ei < extra_uv_sets.size(); ei++) {
+            std::vector<float> src_extra = get_indexed_array(tri, geo, "TEXCOORD", extra_uv_sets[ei], 2);
+            if (!src_extra.empty()) {
+                for (int i = 0; i < vtx_count; i++) {
+                    dst_tverts_extra[ei][(corner_offset + i) * 2 + 0] = src_extra[i * 2 + 0];
+                    dst_tverts_extra[ei][(corner_offset + i) * 2 + 1] = src_extra[i * 2 + 1];
+                }
+            }
+        }
+
         if (!src_colors.empty()) {
             has_colors = true;
             for (int i = 0; i < vtx_count; i++) {
@@ -630,6 +740,24 @@ static Mesh convert_geometry(const DaeGeometry &geo,
                     std::clamp(src_colors[i * 4 + 2], 0.0f, 1.0f) * 255.0f);
                 dst_colors[(corner_offset + i) * 4 + 3] = uint8_t(
                     std::clamp(src_colors[i * 4 + 3], 0.0f, 1.0f) * 255.0f);
+            }
+        }
+        /* Accumulate all color layers. */
+        if (has_color_layers) {
+            for (int li = 0; li < num_color_layers; li++) {
+                if (!src_color_layers[li].empty()) {
+                    has_colors = true;
+                    for (int i = 0; i < vtx_count; i++) {
+                        dst_color_layers[li][(corner_offset + i) * 4 + 0] = uint8_t(
+                            std::clamp(src_color_layers[li][i * 4 + 0], 0.0f, 1.0f) * 255.0f);
+                        dst_color_layers[li][(corner_offset + i) * 4 + 1] = uint8_t(
+                            std::clamp(src_color_layers[li][i * 4 + 1], 0.0f, 1.0f) * 255.0f);
+                        dst_color_layers[li][(corner_offset + i) * 4 + 2] = uint8_t(
+                            std::clamp(src_color_layers[li][i * 4 + 2], 0.0f, 1.0f) * 255.0f);
+                        dst_color_layers[li][(corner_offset + i) * 4 + 3] = uint8_t(
+                            std::clamp(src_color_layers[li][i * 4 + 3], 0.0f, 1.0f) * 255.0f);
+                    }
+                }
             }
         }
 
@@ -661,13 +789,74 @@ static Mesh convert_geometry(const DaeGeometry &geo,
     if (has_tverts1) {
         fill_block(mesh.tverts2, dst_tverts1.data(), total_corners, 8);
     }
+    /* Fill extra UV layers. */
+    for (size_t ei = 0; ei < dst_tverts_extra.size(); ei++) {
+        mesh.tverts_extra.emplace_back();
+        fill_block(mesh.tverts_extra.back(), dst_tverts_extra[ei].data(), total_corners, 8);
+    }
     if (has_colors) {
         fill_block(mesh.colors, dst_colors.data(), total_corners, 4);
+    }
+    /* Fill multiple color layers. */
+    if (has_color_layers) {
+        for (int li = 0; li < num_color_layers; li++) {
+            mesh.color_layers.emplace_back();
+            fill_block(mesh.color_layers.back(), dst_color_layers[li].data(), total_corners, 4);
+            mesh.color_layer_names.push_back(color_layer_names[li]);
+        }
     }
     fill_block(mesh.indices, dst_indices.data(), total_corners, 4);
 
     int prim_count = int(dst_primitives.size()) / 3;
     fill_block(mesh.primitives, dst_primitives.data(), prim_count, 12);
+
+    /* Fill line indices from <lines> elements.
+     * Line indices reference the original position source (via <vertices>),
+     * so we store them as pairs of position-source vertex indices.
+     * We also store the original position array in line_verts.
+     * mesh_builder.py will add extra vertices for line-only positions and create loose edges. */
+    if (!geo.lines.empty()) {
+        /* Find the position source via the <vertices> element. */
+        for (const auto &tri : geo.triangles) {
+            for (const auto &inp : tri.inputs) {
+                if (inp.semantic == "VERTEX") {
+                    /* VERTEX input references <vertices> id, which maps to position source.
+                     * parse_input already strips leading # from source. */
+                    const std::string &vkey = inp.source;
+                    auto it = geo.sources.find(vkey);
+                    if (it != geo.sources.end()) {
+                        const auto &src = it->second;
+                        fill_block(mesh.line_verts, src.data.data(),
+                                   int(src.data.size()) / 3, 12);
+                    }
+                    break;
+                }
+            }
+            break;
+        }
+
+        std::vector<int32_t> all_line_indices;
+        for (const auto &lines : geo.lines) {
+            int vtx_offset = 0;
+            for (const auto &inp : lines.inputs) {
+                if (inp.semantic == "VERTEX") { vtx_offset = inp.offset; break; }
+            }
+            int stride = 1;
+            for (const auto &inp : lines.inputs) {
+                if (inp.offset + 1 > stride) stride = inp.offset + 1;
+            }
+            for (int i = 0; i < lines.line_count && (i * 2 + 1) * stride <= int(lines.indices.size()); i++) {
+                int32_t v0 = lines.indices[i * 2 * stride + vtx_offset];
+                int32_t v1 = lines.indices[(i * 2 + 1) * stride + vtx_offset];
+                all_line_indices.push_back(v0);
+                all_line_indices.push_back(v1);
+            }
+        }
+        if (!all_line_indices.empty()) {
+            fill_block(mesh.line_indices, all_line_indices.data(),
+                       int(all_line_indices.size()) / 2, 8);
+        }
+    }
 
     mesh.verts_per_frame = total_corners;
     mesh.num_frames = 1;
@@ -784,7 +973,8 @@ struct NodeBuildState {
 static int process_node(const DaeNode &dae_node,
                          int parent_idx,
                          const std::map<std::string, DaeGeometry> &geometries,
-                         NodeBuildState &state)
+                         NodeBuildState &state,
+                         ShapeData &shape)
 {
     int node_idx = int(state.node_raws.size()) / 5;
 
@@ -827,15 +1017,25 @@ static int process_node(const DaeNode &dae_node,
             int mesh_start = (mesh_start_it != state.geometry_name_to_mesh_start.end())
                                  ? mesh_start_it->second
                                  : 0;
-            int mesh_count = 0;
-            for (const auto &tri : geo.triangles) {
-                if (tri.triangle_count > 0) {
-                    mesh_count = 1;
-                    break;
+            int mesh_count = 1;
+
+            /* Apply UV layer names from bind_vertex_input to the mesh. */
+            if (mesh_start >= 0 && mesh_start < int(shape.meshes.size())) {
+                Mesh &mesh_ref = shape.meshes[mesh_start];
+                int max_uv_set = 0;
+                for (const auto &uv : dae_node.uv_layer_names) {
+                    if (uv.first > max_uv_set) max_uv_set = uv.first;
+                }
+                mesh_ref.tvert_names.clear();
+                mesh_ref.tvert_names.resize(max_uv_set + 1, "UVMap");
+                for (const auto &uv : dae_node.uv_layer_names) {
+                    if (uv.first >= 0 && uv.first < int(mesh_ref.tvert_names.size())) {
+                        mesh_ref.tvert_names[uv.first] = uv.second;
+                    }
                 }
             }
 
-            if (mesh_count > 0) {
+            {
                 int obj_name_idx = name_idx;
 
                 int obj_slot = int(state.object_raws.size());
@@ -857,7 +1057,7 @@ static int process_node(const DaeNode &dae_node,
     int first_child = -1;
     int prev_child = -1;
     for (const auto &child : dae_node.children) {
-        int child_idx = process_node(child, node_idx, geometries, state);
+        int child_idx = process_node(child, node_idx, geometries, state, shape);
         if (first_child == -1) {
             first_child = child_idx;
         }
@@ -932,6 +1132,9 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
         float base_color[4] = {0.8f, 0.8f, 0.8f, 1.0f};
         float roughness = 0.5f;
         float metallic = 0.0f;
+        float ior = 1.45f;
+        bool has_shininess = false;
+        bool has_reflectivity = false;
     };
     std::map<std::string, EffectPBR> effect_pbr_map;
 
@@ -973,6 +1176,7 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
                             pugi::xml_node f = child_by_tag(refl, "float");
                             if (f) {
                                 pbr.metallic = safe_atof(f.text().get());
+                                pbr.has_reflectivity = true;
                             }
                         }
 
@@ -984,6 +1188,7 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
                                 float sh = safe_atof(f.text().get());
                                 /* COLLADA shininess 0-1000 → roughness 1-0. */
                                 pbr.roughness = std::clamp(1.0f - sh / 1000.0f, 0.0f, 1.0f);
+                                pbr.has_shininess = true;
                             }
                         }
 
@@ -1002,6 +1207,15 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
                                         pbr.base_color[3] = c[3];
                                     }
                                 }
+                            }
+                        }
+
+                        /* Parse <index_of_refraction><float> → IOR. */
+                        pugi::xml_node ior_node = child_by_tag(shader, "index_of_refraction");
+                        if (ior_node) {
+                            pugi::xml_node f = child_by_tag(ior_node, "float");
+                            if (f) {
+                                pbr.ior = safe_atof(f.text().get());
                             }
                         }
                     }
@@ -1036,6 +1250,9 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
                     memcpy(cdae_mat.base_color, pbr.base_color, sizeof(float) * 4);
                     cdae_mat.roughness = pbr.roughness;
                     cdae_mat.metallic = pbr.metallic;
+                    cdae_mat.ior = pbr.ior;
+                    cdae_mat.has_shininess = pbr.has_shininess;
+                    cdae_mat.has_reflectivity = pbr.has_reflectivity;
                 }
             }
 
@@ -1089,14 +1306,21 @@ std::unique_ptr<ShapeData> dae_read_from_bytes(const uint8_t *bytes, size_t size
 
         if (has_valid_triangles) {
             Mesh cmesh = convert_geometry(geo, mat_name_to_idx, mat_id_to_idx, unit_meter);
+            cmesh.geometry_name = geo.name;
             shape->meshes.push_back(std::move(cmesh));
+        } else {
+            Mesh null_mesh;
+            null_mesh.mesh_type = MESH_NULL;
+            null_mesh.is_dae = true;
+            null_mesh.geometry_name = geo.name;
+            shape->meshes.push_back(std::move(null_mesh));
         }
     }
 
     /* Build node/object hierarchy. */
     int prev_sibling = -1;
     for (const auto &dae_node : dae_nodes) {
-        int node_idx = process_node(dae_node, -1, geometries, state);
+        int node_idx = process_node(dae_node, -1, geometries, state, *shape);
         if (prev_sibling != -1) {
             state.node_raws[prev_sibling * 5 + 4] = node_idx;
         }

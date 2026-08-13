@@ -6,6 +6,7 @@ __pycache__/
 # Build artifacts
 *.zip
 dist/
+io_beamng_dae/wheels/*.whl
 
 # Native build temp files
 native/.build_venv*

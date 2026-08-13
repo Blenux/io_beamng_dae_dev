@@ -13,6 +13,12 @@ import re
 import sys
 from pathlib import Path
 
+# Supported Blender extension Python ABI versions.
+# Only wheels matching these versions are included in the manifest.
+# Blender 5.0.1 → 3.11, Blender 5.2+ → 3.13.
+# Do NOT build or include 3.14 wheels — no Blender version uses 3.14 yet.
+SUPPORTED_PY_VERSIONS = {"3.11", "3.13"}
+
 # Wheel platform tag -> Blender platform name
 # macOS mappings kept for community use; BeamNG.drive has no macOS binaries,
 # so no macOS wheels are built by default. Build them yourself and update_manifest.py
@@ -43,8 +49,17 @@ def main() -> int:
         print(f"Error: {MANIFEST} not found", file=sys.stderr)
         return 1
 
-    # Scan for actual wheels
-    wheels = sorted(WHEELS_DIR.glob("cdae_native-*.whl"))
+    # Scan for actual wheels (filter to supported Python versions only)
+    all_wheels = sorted(WHEELS_DIR.glob("cdae_native-*.whl"))
+    wheels = []
+    for whl in all_wheels:
+        # Extract Python version tag from filename (e.g. cp311, cp313, cp314)
+        m = re.search(r'-cp(\d)(\d+)-', whl.name)
+        if m:
+            py_ver = f"{m.group(1)}.{m.group(2)}"
+            if py_ver not in SUPPORTED_PY_VERSIONS:
+                continue
+        wheels.append(whl)
     if not wheels:
         print("No cdae_native wheels found in ../io_beamng_dae/wheels/")
         return 0

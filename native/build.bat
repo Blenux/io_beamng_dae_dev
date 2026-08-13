@@ -2,8 +2,12 @@
 REM Build cdae_native as a Python wheel for Windows.
 REM Requires: Python 3.11/3.13 installed, Visual Studio Build Tools (C++ workload).
 REM
+REM Blender extension Python ABI versions:
+REM   3.11  — Blender 5.0.1
+REM   3.13  — Blender 5.2.0+
+REM
 REM Usage:
-REM   build.bat                  # Build for all installed Python versions
+REM   build.bat                  # Build for all supported Blender Python versions
 REM   build.bat 3.11             # Build for specific version only
 REM   build.bat 3.11 3.13        # Build for specific versions
 

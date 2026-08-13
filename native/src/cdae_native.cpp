@@ -31,7 +31,7 @@ static void convert_raw_tree(ShapeData &shape)
         return;
     }
 
-    /* BLX - Validate that raw_nodes bytes are large enough for the declared count. */
+    /* Validate that raw_nodes bytes are large enough for the declared count. */
     int node_count = shape.raw_nodes.count;
     if (int(shape.raw_nodes.bytes.size()) < node_count * 20) {
         node_count = int(shape.raw_nodes.bytes.size()) / 20;
@@ -83,7 +83,7 @@ static void convert_raw_tree(ShapeData &shape)
         shape.nodes.push_back(std::move(node));
     }
 
-    /* BLX - Validate that raw_objects bytes are large enough for the declared count. */
+    /* Validate that raw_objects bytes are large enough for the declared count. */
     int obj_count = shape.raw_objects.count;
     if (int(shape.raw_objects.bytes.size()) < obj_count * 24) {
         obj_count = int(shape.raw_objects.bytes.size()) / 24;
@@ -235,6 +235,9 @@ static py::dict mesh_to_dict(const Mesh &mesh)
     result["is_dae"] = mesh.is_dae;
     result["mesh_type"] = uint32_t(mesh.mesh_type);
     result["verts_per_frame"] = mesh.verts_per_frame;
+    if (!mesh.geometry_name.empty()) {
+        result["geometry_name"] = mesh.geometry_name;
+    }
 
     if (mesh.mesh_type == MESH_NULL) {
         result["is_null"] = true;
@@ -266,10 +269,49 @@ static py::dict mesh_to_dict(const Mesh &mesh)
         result["uv1"] = uv1;
     }
 
+    /* Pass extra UV layers (2+) back to Python. */
+    if (!mesh.tverts_extra.empty()) {
+        py::list extra_uvs;
+        for (const auto &eb : mesh.tverts_extra) {
+            if (eb.count > 0) {
+                py::array_t<float> arr({eb.count, 2});
+                memcpy(arr.request().ptr, eb.bytes.data(), eb.bytes.size());
+                extra_uvs.append(arr);
+            }
+        }
+        result["uv_extra"] = extra_uvs;
+    }
+
+    /* Pass UV layer names for bind_vertex_input preservation. */
+    if (!mesh.tvert_names.empty()) {
+        py::list uv_names;
+        for (const auto &n : mesh.tvert_names) {
+            uv_names.append(py::cast(n));
+        }
+        result["tvert_names"] = uv_names;
+    }
+
     if (mesh.colors.count > 0) {
         py::array_t<uint8_t> colors({mesh.colors.count, 4});
         memcpy(colors.request().ptr, mesh.colors.bytes.data(), mesh.colors.bytes.size());
         result["colors"] = colors;
+    }
+    /* Pass multiple color layers back to Python. */
+    if (!mesh.color_layers.empty()) {
+        py::list layers;
+        for (const auto &lb : mesh.color_layers) {
+            if (lb.count > 0) {
+                py::array_t<uint8_t> arr({lb.count, 4});
+                memcpy(arr.request().ptr, lb.bytes.data(), lb.bytes.size());
+                layers.append(arr);
+            }
+        }
+        result["color_layers"] = layers;
+        py::list names;
+        for (const auto &n : mesh.color_layer_names) {
+            names.append(py::cast(n));
+        }
+        result["color_layer_names"] = names;
     }
 
     if (mesh.tangents.count > 0) {
@@ -288,6 +330,18 @@ static py::dict mesh_to_dict(const Mesh &mesh)
         py::array_t<uint32_t> prims({mesh.primitives.count, 3});
         memcpy(prims.request().ptr, mesh.primitives.bytes.data(), mesh.primitives.bytes.size());
         result["primitives"] = prims;
+    }
+
+    /* Pass line (loose edge) data for <lines> round-trip. */
+    if (mesh.line_indices.count > 0) {
+        py::array_t<int32_t> line_idx({mesh.line_indices.count, 2});
+        memcpy(line_idx.request().ptr, mesh.line_indices.bytes.data(), mesh.line_indices.bytes.size());
+        result["line_indices"] = line_idx;
+    }
+    if (mesh.line_verts.count > 0) {
+        py::array_t<float> line_vts({mesh.line_verts.count, 3});
+        memcpy(line_vts.request().ptr, mesh.line_verts.bytes.data(), mesh.line_verts.bytes.size());
+        result["line_verts"] = line_vts;
     }
 
     /* CDAE binary: encoded norms (uint8 packed normals). */
@@ -387,6 +441,9 @@ static py::dict shape_to_dict(const ShapeData &shape)
         m["base_color"] = bc;
         m["roughness"] = mat.roughness;
         m["metallic"] = mat.metallic;
+        m["ior"] = mat.ior;
+        m["has_shininess"] = mat.has_shininess;
+        m["has_reflectivity"] = mat.has_reflectivity;
         materials.append(m);
     }
     result["materials"] = materials;
@@ -477,6 +534,10 @@ static std::unique_ptr<ShapeData> dict_to_shape(py::dict data)
                              ? MESH_NULL
                              : MESH_STANDARD;
 
+        if (m.contains("geometry_name") && !m["geometry_name"].is_none()) {
+            mesh.geometry_name = m["geometry_name"].cast<std::string>();
+        }
+
         if (mesh.mesh_type != MESH_NULL) {
             if (m.contains("vertices") && !m["vertices"].is_none()) {
                 mesh.verts = numpy_to_block(m["vertices"], 12);
@@ -490,8 +551,35 @@ static std::unique_ptr<ShapeData> dict_to_shape(py::dict data)
             if (m.contains("uv1") && !m["uv1"].is_none()) {
                 mesh.tverts2 = numpy_to_block(m["uv1"], 8);
             }
+            if (m.contains("uv_extra") && !m["uv_extra"].is_none()) {
+                py::list extra = m["uv_extra"].cast<py::list>();
+                for (auto item : extra) {
+                    if (!item.is_none()) {
+                        mesh.tverts_extra.push_back(numpy_to_block(item.cast<py::object>(), 8));
+                    }
+                }
+            }
+            if (m.contains("tvert_names") && !m["tvert_names"].is_none()) {
+                py::list names = m["tvert_names"].cast<py::list>();
+                for (auto item : names) {
+                    mesh.tvert_names.push_back(item.cast<std::string>());
+                }
+            }
             if (m.contains("colors") && !m["colors"].is_none()) {
                 mesh.colors = numpy_to_block(m["colors"], 4);
+            }
+            /* Parse multiple color layers for DAE export. */
+            if (m.contains("color_layers") && !m["color_layers"].is_none()) {
+                py::list layers = m["color_layers"].cast<py::list>();
+                for (auto item : layers) {
+                    mesh.color_layers.push_back(numpy_to_block(item.cast<py::object>(), 4));
+                }
+            }
+            if (m.contains("color_layer_names") && !m["color_layer_names"].is_none()) {
+                py::list names = m["color_layer_names"].cast<py::list>();
+                for (auto item : names) {
+                    mesh.color_layer_names.push_back(py::cast<std::string>(item));
+                }
             }
             if (m.contains("tangents") && !m["tangents"].is_none()) {
                 mesh.tangents = numpy_to_block(m["tangents"], 16);
@@ -501,6 +589,13 @@ static std::unique_ptr<ShapeData> dict_to_shape(py::dict data)
             }
             if (m.contains("primitives") && !m["primitives"].is_none()) {
                 mesh.primitives = numpy_to_block(m["primitives"], 12);
+            }
+            /* Parse line (loose edge) data for <lines> export. */
+            if (m.contains("line_indices") && !m["line_indices"].is_none()) {
+                mesh.line_indices = numpy_to_block(m["line_indices"], 8);
+            }
+            if (m.contains("line_verts") && !m["line_verts"].is_none()) {
+                mesh.line_verts = numpy_to_block(m["line_verts"], 12);
             }
             if (mesh.verts.count > 0) {
                 mesh.verts_per_frame = mesh.verts.count;
@@ -533,6 +628,15 @@ static std::unique_ptr<ShapeData> dict_to_shape(py::dict data)
         }
         if (m.contains("metallic")) {
             mat.metallic = py::cast<float>(m["metallic"]);
+        }
+        if (m.contains("ior")) {
+            mat.ior = py::cast<float>(m["ior"]);
+        }
+        if (m.contains("has_shininess")) {
+            mat.has_shininess = py::cast<bool>(m["has_shininess"]);
+        }
+        if (m.contains("has_reflectivity")) {
+            mat.has_reflectivity = py::cast<bool>(m["has_reflectivity"]);
         }
         shape->materials.push_back(std::move(mat));
     }
@@ -627,10 +731,12 @@ PYBIND11_MODULE(cdae_native, m) {
     }, py::arg("data"),
        "Parse .dae from in-memory bytes and return mesh/material/node data");
 
-    m.def("write_dae", [](const std::string &filepath, py::dict data) {
+    m.def("write_dae", [](const std::string &filepath, py::dict data,
+                          const std::string &authoring_tool) {
         auto shape = dict_to_shape(data);
-        return dae_write_file(*shape, filepath.c_str());
+        return dae_write_file(*shape, filepath.c_str(), authoring_tool);
     }, py::arg("filepath"), py::arg("data"),
+       py::arg("authoring_tool") = "Blender",
        "Write mesh/material/node data to a .dae file");
 
     /* --- CDAE Binary --- */

@@ -11,16 +11,56 @@ from array import array
 
 class MeshExtractor:
     def __init__(self, global_scale=1.0, apply_modifiers=True,
-                 custom_normals=True, active_uv_only=False):
+                 custom_normals=True, active_uv_only=False, dae_material_order=None):
         self.global_scale = global_scale
         self.apply_modifiers = apply_modifiers
         self.custom_normals = custom_normals
         self.active_uv_only = active_uv_only
+        self.dae_material_order = dae_material_order
 
     def extract(self, objects):
         """Extract mesh data from Blender objects into a dict for cdae_native."""
         meshes = []
         materials = []
+
+        # Pre-populate materials from stored DAE order to preserve unused materials
+        if self.dae_material_order:
+            for mat_name in self.dae_material_order:
+                mat = bpy.data.materials.get(mat_name)
+                if mat is None:
+                    mat = bpy.data.materials.new(mat_name)
+                mat_entry = {"name": mat.name, "flags": 3}
+                bc_r, bc_g, bc_b, bc_a = 0.8, 0.8, 0.8, 1.0
+                roughness = 0.5
+                metallic = 0.0
+                has_bsdf = False
+                if mat.use_nodes:
+                    bsdf = mat.node_tree.nodes.get("Principled BSDF")
+                    if bsdf is not None:
+                        has_bsdf = True
+                        bc = bsdf.inputs.get("Base Color")
+                        if bc is not None:
+                            dv = bc.default_value
+                            bc_r, bc_g, bc_b, bc_a = float(dv[0]), float(dv[1]), float(dv[2]), float(dv[3])
+                        rough = bsdf.inputs.get("Roughness")
+                        if rough is not None:
+                            roughness = float(rough.default_value)
+                        metal = bsdf.inputs.get("Metallic")
+                        if metal is not None:
+                            metallic = float(metal.default_value)
+                if not has_bsdf:
+                    dc = mat.diffuse_color
+                    bc_r, bc_g, bc_b, bc_a = float(dc[0]), float(dc[1]), float(dc[2]), float(dc[3])
+                    roughness = float(mat.roughness)
+                    metallic = float(mat.metallic)
+                mat_entry["base_color"] = np.array([bc_r, bc_g, bc_b, bc_a], dtype=np.float32)
+                mat_entry["roughness"] = roughness
+                mat_entry["metallic"] = metallic
+                # IOR and roundtrip flags from custom properties
+                mat_entry["ior"] = float(mat.get("dae_ior", 1.45))
+                mat_entry["has_shininess"] = bool(mat.get("dae_has_shininess", False))
+                mat_entry["has_reflectivity"] = bool(mat.get("dae_has_reflectivity", False))
+                materials.append(mat_entry)
 
         node_entries = []
         object_entries = []
@@ -37,7 +77,7 @@ class MeshExtractor:
             # Build local-to-global material index mapping
             local_to_global_mat = {}
 
-            # BLX - Dict for O(1) material name → global index lookup
+            # Dict for O(1) material name → global index lookup
             mat_name_to_global = {m["name"]: i for i, m in enumerate(materials)}
 
             # Collect used material slot indices from face material_index
@@ -86,6 +126,10 @@ class MeshExtractor:
                     mat_entry["base_color"] = np.array([bc_r, bc_g, bc_b, bc_a], dtype=np.float32)
                     mat_entry["roughness"] = roughness
                     mat_entry["metallic"] = metallic
+                    # IOR and roundtrip flags from custom properties
+                    mat_entry["ior"] = float(mat.get("dae_ior", 1.45))
+                    mat_entry["has_shininess"] = bool(mat.get("dae_has_shininess", False))
+                    mat_entry["has_reflectivity"] = bool(mat.get("dae_has_reflectivity", False))
                     materials.append(mat_entry)
                     global_idx = len(materials) - 1
                     mat_name_to_global[mat.name] = global_idx
@@ -98,6 +142,14 @@ class MeshExtractor:
                 if eval_obj is not None:
                     eval_obj.to_mesh_clear()
                 continue
+
+            geo_name = obj.get("dae_geometry_name", "")
+            if geo_name:
+                mesh_data["geometry_name"] = geo_name
+
+            tvert_names = obj.get("dae_tvert_names", "")
+            if tvert_names:
+                mesh_data["tvert_names"] = list(tvert_names)
 
             mesh_idx = len(meshes)
             meshes.append(mesh_data)
@@ -155,7 +207,17 @@ class MeshExtractor:
     def _extract_mesh(self, mesh, obj, local_to_global_mat):
         """Extract mesh data into dict format for cdae_native — vectorized."""
         if mesh.polygons is None or len(mesh.polygons) == 0:
-            return None
+            # Lines-only mesh: extract loose edges and vertex positions
+            result = {"is_null": True, "is_dae": True, "verts_per_frame": 0}
+            if len(mesh.vertices) > 0 and len(mesh.edges) > 0:
+                vert_positions = np.empty(len(mesh.vertices) * 3, dtype=np.float32)
+                mesh.vertices.foreach_get("co", vert_positions)
+                vert_positions = vert_positions.reshape(-1, 3)
+                loose_edges = self._extract_loose_edges(mesh)
+                if loose_edges is not None:
+                    result["line_indices"] = loose_edges
+                    result["line_verts"] = np.ascontiguousarray(vert_positions, dtype=np.float32)
+            return result
 
         # corner_normals is auto-computed in Blender 4.1+
 
@@ -214,6 +276,8 @@ class MeshExtractor:
         # UV layers — vectorized foreach_get
         uv0_data = None
         uv1_data = None
+        uv_extra_data = []  # Extra UV layers (2+)
+        uv_layer_names = []  # Names of all UV layers in order
 
         if mesh.uv_layers:
             if self.active_uv_only:
@@ -222,6 +286,7 @@ class MeshExtractor:
                     uv0_data = np.empty(loop_count * 2, dtype=np.float32)
                     active_uv.data.foreach_get("uv", uv0_data)
                     uv0_data = uv0_data.reshape(-1, 2)
+                    uv_layer_names.append(active_uv.name)
             else:
                 uv0_layer = mesh.uv_layers.get("UV0")
                 if uv0_layer is None:
@@ -230,13 +295,25 @@ class MeshExtractor:
                     uv0_data = np.empty(loop_count * 2, dtype=np.float32)
                     uv0_layer.data.foreach_get("uv", uv0_data)
                     uv0_data = uv0_data.reshape(-1, 2)
+                    uv_layer_names.append(uv0_layer.name)
 
+                extra_uv_layers = []
                 for layer in mesh.uv_layers:
-                    if layer.name != "UV0" and layer != uv0_layer:
-                        uv1_data = np.empty(loop_count * 2, dtype=np.float32)
-                        layer.data.foreach_get("uv", uv1_data)
-                        uv1_data = uv1_data.reshape(-1, 2)
-                        break
+                    if layer != uv0_layer:
+                        extra_uv_layers.append(layer)
+
+                if extra_uv_layers:
+                    first_extra = extra_uv_layers[0]
+                    uv1_data = np.empty(loop_count * 2, dtype=np.float32)
+                    first_extra.data.foreach_get("uv", uv1_data)
+                    uv1_data = uv1_data.reshape(-1, 2)
+                    uv_layer_names.append(first_extra.name)
+
+                    for layer in extra_uv_layers[1:]:
+                        ed = np.empty(loop_count * 2, dtype=np.float32)
+                        layer.data.foreach_get("uv", ed)
+                        uv_extra_data.append(ed.reshape(-1, 2))
+                        uv_layer_names.append(layer.name)
 
         # Corner normals — vectorized via foreach_get on collection
         corner_normals = None
@@ -255,21 +332,25 @@ class MeshExtractor:
         mesh.polygons.foreach_get("normal", face_normals)
         face_normals = face_normals.reshape(-1, 3)
 
-        # Vertex colors — vectorized
-        color_data = None
-        color_layer = mesh.color_attributes.get("Color") if mesh.color_attributes else None
-        if color_layer is None and mesh.color_attributes:
-            color_layer = mesh.color_attributes.active
-        if color_layer and color_layer.domain == 'CORNER':
-            color_data = np.empty(loop_count * 4, dtype=np.float32)
-            color_layer.data.foreach_get("color", color_data)
-            color_data = (color_data.reshape(-1, 4) * 255).astype(np.uint8)
-        elif color_layer and color_layer.domain == 'POINT':
-            color_data = np.empty(vert_count * 4, dtype=np.float32)
-            color_layer.data.foreach_get("color", color_data)
-            color_data = (color_data.reshape(-1, 4) * 255).astype(np.uint8)
-            # Expand to corner
-            color_data = color_data[corner_verts]
+        # Vertex colors — extract all color attribute layers.
+        color_layers_list = []
+        if mesh.color_attributes:
+            for layer in mesh.color_attributes:
+                if layer.domain == 'CORNER':
+                    cd = np.empty(loop_count * 4, dtype=np.float32)
+                    layer.data.foreach_get("color", cd)
+                    cd = (cd.reshape(-1, 4) * 255).astype(np.uint8)
+                    color_layers_list.append((layer.name, cd, 'CORNER'))
+                elif layer.domain == 'POINT':
+                    cd = np.empty(vert_count * 4, dtype=np.float32)
+                    layer.data.foreach_get("color", cd)
+                    cd = (cd.reshape(-1, 4) * 255).astype(np.uint8)
+                    color_layers_list.append((layer.name, cd, 'POINT'))
+                else:
+                    continue
+
+        # Keep single color_data for backwards compat (first layer)
+        color_data = color_layers_list[0][1] if color_layers_list else None
 
         # Build triangulated corner data — vectorized where possible
         has_nor = corner_normals is not None
@@ -278,13 +359,13 @@ class MeshExtractor:
         has_col = color_data is not None
 
         # Fan triangulation: build triangle → (loop0, loop1, loop2) index arrays
-        # BLX - Vectorized: for each face with n verts, generate (n-2) triangles
+        # Vectorized: for each face with n verts, generate (n-2) triangles
         # Triangle t in face fi: (start, start+t, start+t+1)
         tri_counts_per_face = np.maximum(face_lengths - 2, 0)
         total_tris = int(tri_counts_per_face.sum())
 
         if total_tris == 0:
-            return None
+            return {"is_null": True, "is_dae": True, "verts_per_frame": 0}
 
         # Repeat face index for each triangle in that face
         tri_face_idx = np.repeat(np.arange(poly_count, dtype=np.int32), tri_counts_per_face)
@@ -341,9 +422,17 @@ class MeshExtractor:
         else:
             corner_uv1 = None
 
-        # Colors per corner
+        # Extra UV layers per corner (V-flip)
+        corner_uv_extra = []
+        for uv_data in uv_extra_data:
+            cu = uv_data[corner_loop_indices].copy()
+            cu[:, 1] = 1.0 - cu[:, 1]
+            corner_uv_extra.append(cu)
+
+        # Colors per corner (first layer for backwards compat)
         if has_col:
-            if color_layer.domain == 'CORNER':
+            first_domain = color_layers_list[0][2]
+            if first_domain == 'CORNER':
                 corner_col = color_data[corner_loop_indices]
             else:
                 corner_col = color_data[corner_vi]
@@ -364,6 +453,8 @@ class MeshExtractor:
             corner_uv0 = corner_uv0.reshape(-1, 3, 2)[sort_order].reshape(-1, 2)
         if corner_uv1 is not None:
             corner_uv1 = corner_uv1.reshape(-1, 3, 2)[sort_order].reshape(-1, 2)
+        for ci in range(len(corner_uv_extra)):
+            corner_uv_extra[ci] = corner_uv_extra[ci].reshape(-1, 3, 2)[sort_order].reshape(-1, 2)
         if corner_col is not None:
             corner_col = corner_col.reshape(-1, 3, 4)[sort_order].reshape(-1, 4)
 
@@ -398,8 +489,23 @@ class MeshExtractor:
         if corner_uv1 is not None:
             result["uv1"] = np.ascontiguousarray(corner_uv1, dtype=np.float32)
 
+        if corner_uv_extra:
+            result["uv_extra"] = [np.ascontiguousarray(cu, dtype=np.float32) for cu in corner_uv_extra]
+
         if corner_col is not None:
             result["colors"] = np.ascontiguousarray(corner_col, dtype=np.uint8)
+
+        # Export all color layers for multi-color-layer DAE support.
+        if color_layers_list:
+            result["color_layer_names"] = [name for name, _, _ in color_layers_list]
+            result["color_layers"] = []
+            for name, cd, domain in color_layers_list:
+                if domain == 'CORNER':
+                    layer_corner = cd[corner_loop_indices]
+                else:
+                    layer_corner = cd[corner_vi]
+                layer_corner = layer_corner.reshape(-1, 3, 4)[sort_order].reshape(-1, 4)
+                result["color_layers"].append(np.ascontiguousarray(layer_corner, dtype=np.uint8))
 
         # Indices: sequential 0..N*3-1
         result["indices"] = np.arange(tri_count * 3, dtype=np.uint32)
@@ -407,4 +513,48 @@ class MeshExtractor:
         if primitives_buf:
             result["primitives"] = np.array(primitives_buf, dtype=np.uint32).reshape(-1, 3)
 
+        # Extract loose edges (edges not part of any face) for <lines> export
+        loose_edges = self._extract_loose_edges(mesh)
+        if loose_edges is not None:
+            result["line_indices"] = loose_edges
+            result["line_verts"] = np.ascontiguousarray(vert_positions, dtype=np.float32)
+
         return result
+
+    def _extract_loose_edges(self, mesh):
+        """Find loose edges (edges not part of any face) and return as (N, 2) int32 array.
+
+        Returns None if no loose edges exist.
+        """
+        if len(mesh.edges) == 0:
+            return None
+
+        # Get all edge vertex pairs
+        edge_verts = np.empty(len(mesh.edges) * 2, dtype=np.int32)
+        mesh.edges.foreach_get("vertices", edge_verts)
+        edge_verts = edge_verts.reshape(-1, 2)
+
+        if len(mesh.polygons) == 0:
+            # All edges are loose (no faces)
+            return edge_verts
+
+        # Get face edge indices to identify which edges belong to faces
+        # In Blender 5.x, we can check if an edge is loose via the 'sharp_edge' or
+        # by checking if it's used by any polygon. The simplest way is to use
+        # bmesh to find loose edges.
+        import bmesh
+        bm = bmesh.new()
+        bm.from_mesh(mesh)
+        bm.edges.ensure_lookup_table()
+
+        loose_edge_pairs = []
+        for edge in bm.edges:
+            if len(edge.link_faces) == 0:
+                loose_edge_pairs.append([edge.verts[0].index, edge.verts[1].index])
+
+        bm.free()
+
+        if not loose_edge_pairs:
+            return None
+
+        return np.array(loose_edge_pairs, dtype=np.int32)

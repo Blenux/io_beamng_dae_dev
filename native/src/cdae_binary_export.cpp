@@ -177,7 +177,7 @@ bool write_cdae(const char *filepath, const ShapeData &shape, bool compress)
     }
 
     /* File version header: little-endian uint16(31), uint16(0), uint32(header_size). */
-    /* BLX - Write as explicit little-endian bytes for cross-platform portability. */
+    /* Write as explicit little-endian bytes for cross-platform portability. */
     uint16_t ver = 31;
     uint16_t expver = 0;
     uint32_t hsize = uint32_t(header_bytes.size());

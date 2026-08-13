@@ -22,6 +22,9 @@ def _create_materials(materials_data):
         base_color = mat_data.get("base_color")
         roughness = float(mat_data.get("roughness", 0.5))
         metallic = float(mat_data.get("metallic", 0.0))
+        ior = float(mat_data.get("ior", 1.45))
+        has_shininess = bool(mat_data.get("has_shininess", False))
+        has_reflectivity = bool(mat_data.get("has_reflectivity", False))
 
         bc_r = bc_g = bc_b = 0.8
         bc_a = 1.0
@@ -44,6 +47,13 @@ def _create_materials(materials_data):
                 bsdf.inputs["Roughness"].default_value = roughness
             if "Metallic" in bsdf.inputs:
                 bsdf.inputs["Metallic"].default_value = metallic
+            if "IOR" in bsdf.inputs:
+                bsdf.inputs["IOR"].default_value = ior
+
+        # Store roundtrip flags as custom properties
+        mat["dae_has_shininess"] = has_shininess
+        mat["dae_has_reflectivity"] = has_reflectivity
+        mat["dae_ior"] = ior
 
         materials.append(mat)
     return materials
@@ -165,6 +175,12 @@ class ImportDAE(bpy.types.Operator, ImportHelper):
 
         objects = builder.build_meshes(data)
         builder.build_node_hierarchy(data, objects)
+
+        # Store DAE material order for 1:1 roundtrip preservation
+        mat_names = [m.get("name", "") for m in data.get("materials", [])]
+        if mat_names:
+            col = builder._get_import_collection() if builder.use_collection else context.collection
+            col["dae_material_order"] = mat_names
 
         mesh_count = len([o for o in objects.values() if o.type == 'MESH'])
         self.report({"INFO"}, f"Imported {mesh_count} mesh(es), {len(materials)} material(s)")

@@ -114,11 +114,21 @@ class ExportDAE(bpy.types.Operator, ExportHelper):
             self.report({"WARNING"}, "No mesh objects to export")
             return {"CANCELLED"}
 
+        # Find dae_material_order from collections
+        dae_material_order = None
+        for col in bpy.data.collections:
+            if "dae_material_order" in col:
+                dae_material_order = col["dae_material_order"]
+                break
+        if dae_material_order is None and "dae_material_order" in context.scene.collection:
+            dae_material_order = context.scene.collection["dae_material_order"]
+
         extractor = MeshExtractor(
             global_scale=self.global_scale,
             apply_modifiers=self.apply_modifiers,
             custom_normals=self.custom_normals,
             active_uv_only=self.active_uv_only,
+            dae_material_order=dae_material_order,
         )
 
         data = extractor.extract(objects)
@@ -131,7 +141,9 @@ class ExportDAE(bpy.types.Operator, ExportHelper):
             if is_cdae:
                 cdae_native.write_cdae(filepath, data, True)
             else:
-                cdae_native.write_dae(filepath, data)
+                # Pass Blender version info for <authoring_tool> element.
+                bl_info_str = f"Blender {bpy.app.version_string} commit date:{bpy.app.build_commit_date.decode() if bpy.app.build_commit_date else 'unknown'}, commit time:{bpy.app.build_commit_time.decode() if bpy.app.build_commit_time else 'unknown'}, hash:{bpy.app.build_hash.decode() if bpy.app.build_hash else 'unknown'}"
+                cdae_native.write_dae(filepath, data, authoring_tool=bl_info_str)
         except Exception as e:
             self.report({"ERROR"}, f"Failed to write file: {e}")
             return {"CANCELLED"}
