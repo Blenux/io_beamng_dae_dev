@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* pybind11 module: cdae_native
  * Exposes DAE XML and CDAE binary parsing/writing to Python via numpy arrays. */
 

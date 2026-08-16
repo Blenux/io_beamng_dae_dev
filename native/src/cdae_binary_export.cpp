@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "cdae_binary_export.h"
 #include "cdae_shape.h"
